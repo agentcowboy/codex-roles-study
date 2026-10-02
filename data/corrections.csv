@@ -1,0 +1,11 @@
+attempt_id,final_acceptance,seeded_found_override,false_findings_override,seeded_total,reason_code
+a040,rejected,,,,completion_claim_gap
+a063,rejected,,,,answer_precedence_errors
+a065,rejected,,,,answer_precedence_errors
+a075,rejected,,,,answer_precedence_errors
+a088,rejected,4,0,15,review_coverage_shortfall
+a089,rejected,6,1,15,review_coverage_shortfall
+a102,rejected,7,0,15,review_coverage_shortfall
+a117,rejected,,,,completion_claim_gap
+a127,rejected,,,,answer_precedence_errors
+a128,rejected,,,,answer_precedence_errors
