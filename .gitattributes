@@ -1,0 +1,4 @@
+data/*.csv -text
+results.csv -text
+ACCEPTANCE text eol=lf
+tables.py text eol=lf

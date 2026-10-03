@@ -229,9 +229,77 @@ def check_table(root, table):
             "committed results table differs from regeneration")
 
 
+def advancement(root, attempts, corrections):
+    """Reconstruct selection from first hard runs, then compare confirmed cells."""
+    cells = read_csv(root / "results.csv", RESULT_FIELDS)
+    keys = [(r["fixture_id"], r["model"], r["effort"]) for r in cells]
+    require(len(keys) == len(set(keys)), "duplicate results cell")
+    confirmed = set()
+    for key, row in zip(keys, cells):
+        repeats = number(row["stage2_count"], "stage2_count", integer=True)
+        if repeats:
+            require(repeats == 2 and row["n"] == "3" and row["H_count"] == "1",
+                    "invalid confirmation counts")
+            confirmed.add(key)
+    details = {}
+    for role in ("build", "grounding", "review"):
+        fixture = role + "-hard-v1"
+        rows = [r for r in attempts if r["fixture_id"] == fixture and r["stage"] == "H"]
+        require(bool(rows), role + ": missing advancement inputs")
+        first = {(r["model"], r["effort"]): r for r in rows}
+        require(len(first) == len(rows), role + ": duplicate first hard run")
+
+        def score(row, machine=False):
+            if machine or role == "grounding":
+                return Decimal(row["machine_primary"])
+            if role == "build":
+                return average([Decimal(row["judge_" + j + "_overall"])
+                                for j in ("a", "b")]) / 10
+            return review_counts(row, corrections.get(row["attempt_id"]))[0] / 15
+
+        def select(machine=False):
+            ordered = sorted(first, key=lambda key: (
+                final_status(first[key], corrections) != "accepted",
+                -score(first[key], machine), Decimal(first[key]["credits_est"]), key))
+            top = ordered[:3]
+            incumbent = ("gpt-5.6-luna", "medium") if role == "grounding" else ("gpt-5.6-sol", "high")
+            require(incumbent in first, role + ": missing incumbent")
+            leader = first[top[0]]
+            cheap = [key for key in ordered
+                     if final_status(first[key], corrections) == "accepted"
+                     and Decimal(first[key]["credits_est"]) <= Decimal(leader["credits_est"]) / 3
+                     and score(leader, machine) - score(first[key], machine) <= Decimal("0.15")][:2]
+            return top, incumbent, cheap
+
+        top, incumbent, cheap = select()
+        selected = set(top + [incumbent] + cheap)
+        extras = set()
+        if role == "review":
+            machine_top, machine_incumbent, machine_cheap = select(machine=True)
+            extras = set(machine_top + [machine_incumbent] + machine_cheap) - selected
+        reproduced = {(fixture, *key) for key in selected | extras}
+        observed = {key for key in confirmed if key[0] == fixture}
+        require(observed == reproduced, role + ": confirmed cells differ from reconstructed advancement")
+        details[role] = (top, incumbent, cheap, sorted(extras), len(observed), len(reproduced))
+    require(sum(value[4] for value in details.values()) == len(confirmed),
+            "confirmation outside hard roles")
+    return details
+
+
+def print_advancement(details):
+    def names(keys):
+        return ",".join(model + "/" + effort for model, effort in keys) or "none"
+
+    for role, (top, incumbent, cheap, extras, confirmed, reproduced) in details.items():
+        print("ADVANCEMENT role=%s top=%s incumbent=%s cheap=%s extras=%s confirmed=%d reproduced=%d" %
+              (role, names(top), names([incumbent]), names(cheap), names(extras), confirmed, reproduced))
+    print("ADVANCEMENT confirmed=%d reproduced=%d" %
+          (sum(value[4] for value in details.values()), sum(value[5] for value in details.values())))
+
+
 def negative_controls(root, scratch):
     labels = ("extra-column", "duplicate-id", "missing-judge", "moved-adjudication", "changed-table",
-              "changed-non-table-cell")
+              "changed-non-table-cell", "dropped-confirmation")
     for label in labels:
         target = scratch / label
         shutil.copytree(str(root / "data"), str(target / "data"))
@@ -253,6 +321,10 @@ def negative_controls(root, scratch):
         elif label == "changed-non-table-cell":
             row = next(r for r in attempts if r["stage"] == "H")
             row["judge_a_overall"] = "9" if row["judge_a_overall"] == "10" else "10"
+        elif label == "dropped-confirmation":
+            table = read_csv(target / "results.csv", RESULT_FIELDS)
+            table.remove(next(r for r in table if r["stage2_count"] == "2"))
+            write_csv(target / "results.csv", RESULT_FIELDS, table)
         else:
             table = read_csv(target / "results.csv", RESULT_FIELDS)
             table[0]["n"] = "2"
@@ -261,9 +333,16 @@ def negative_controls(root, scratch):
         write_csv(target / "data/corrections.csv", CORRECTION_FIELDS, corrections)
         result = subprocess.run(
             [sys.executable, "-B", str(Path(__file__).resolve()), "--root", str(target),
-             "--acceptance" if label == "changed-non-table-cell" else "--check"],
+             "--check-frozen" if label == "changed-non-table-cell" else
+             "--advancement" if label == "dropped-confirmation" else "--check"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         require(result.returncode == 1, label + ": negative control did not go RED")
+        if label == "changed-non-table-cell":
+            require("attempts.csv: frozen SHA-256 mismatch" in result.stderr,
+                    label + ": frozen-data check was not the rejection reason")
+        elif label == "dropped-confirmation":
+            require("confirmed cells differ from reconstructed advancement" in result.stderr,
+                    label + ": advancement check was not the rejection reason")
     return labels
 
 
@@ -274,10 +353,15 @@ def write_csv(path, fields, rows):
         writer.writerows(rows)
 
 
-def acceptance(root, attempts, corrections, table):
+def check_frozen_data(root):
     for name, pinned in FROZEN_DATA_SHA256.items():
         observed = base64.b64encode(hashlib.sha256((root / name).read_bytes()).digest()).decode("ascii")
         require(observed == pinned, Path(name).name + ": frozen SHA-256 mismatch")
+
+
+def acceptance(root, attempts, corrections, table):
+    check_frozen_data(root)
+    advanced = advancement(root, attempts, corrections)
     stages = Counter(r["stage"] for r in attempts)
     require(stages == {"0": 3, "1": 35, "H": 75, "2": 40}, "stage accounting mismatch")
     raw = Counter(raw_status(r) for r in attempts)
@@ -327,6 +411,8 @@ def acceptance(root, attempts, corrections, table):
           (len(corrections), higher, unchanged))
     print("CREDITS rows=%d within-rounding=yes" % len(attempts))
     print("TABLES rows=%d regenerated=equal" % len(cells))
+    print("ADVANCEMENT confirmed=%d reproduced=%d" %
+          (sum(value[4] for value in advanced.values()), sum(value[5] for value in advanced.values())))
     print("NEGATIVE_CONTROLS " + " ".join(label + "=RED" for label in labels))
     print("ACCEPTANCE PASS")
 
@@ -336,16 +422,24 @@ def main():
     parser.add_argument("output", nargs="?", help="output CSV path; default stdout")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--check", action="store_true", help="also validate the committed table")
+    parser.add_argument("--check-frozen", action="store_true",
+                        help="validate the committed table and frozen data without running controls")
+    parser.add_argument("--advancement", action="store_true",
+                        help="reconstruct advancement and compare with confirmed table cells")
     parser.add_argument("--acceptance", action="store_true", help="run the historical accounting and controls")
     args = parser.parse_args()
     try:
         attempts, corrections = validate(args.root)
         table = render(attempts, corrections)
-        if args.check or args.acceptance:
+        if args.check or args.check_frozen or args.acceptance:
             check_table(args.root, table)
+        if args.check_frozen:
+            check_frozen_data(args.root)
         if args.acceptance:
             acceptance(args.root, attempts, corrections, table)
-        elif not args.check:
+        elif args.advancement:
+            print_advancement(advancement(args.root, attempts, corrections))
+        elif not (args.check or args.check_frozen):
             if args.output:
                 Path(args.output).write_bytes(table.encode("utf-8"))
             else:
