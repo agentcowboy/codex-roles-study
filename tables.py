@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Validate disclosed observations and regenerate the historical cell table."""
 import argparse
+import base64
 import csv
+import hashlib
 import io
 import re
 import shutil
@@ -22,6 +24,11 @@ HISTORICAL_RATES = {
     "gpt-5.6-sol": (Decimal("100"), Decimal("10"), Decimal("500")),
     "gpt-5.6-terra": (Decimal("50"), Decimal("5"), Decimal("300")),
     "gpt-5.6-luna": (Decimal("5"), Decimal("0.5"), Decimal("30")),
+}
+# Frozen data SHA-256 digests, encoded in base64.
+FROZEN_DATA_SHA256 = {
+    "data/attempts.csv": "pkxI0dheLimVGK3k3lwEaVUHZ6ExcnFh/CR2AhNFb08=",
+    "data/corrections.csv": "szd6hgcvGiWwrzanC0RIKqZI3SD/kxPp0jj4m7O44Fo=",
 }
 ATTEMPT_FIELDS = (
     "attempt_id,fixture_id,stage,model,effort,result_class,input_tokens,"
@@ -223,7 +230,8 @@ def check_table(root, table):
 
 
 def negative_controls(root, scratch):
-    labels = ("extra-column", "duplicate-id", "missing-judge", "moved-adjudication", "changed-table")
+    labels = ("extra-column", "duplicate-id", "missing-judge", "moved-adjudication", "changed-table",
+              "changed-non-table-cell")
     for label in labels:
         target = scratch / label
         shutil.copytree(str(root / "data"), str(target / "data"))
@@ -242,6 +250,9 @@ def negative_controls(root, scratch):
         elif label == "moved-adjudication":
             corrections[0]["attempt_id"] = next(
                 r["attempt_id"] for r in attempts if raw_status(r) == "accepted")
+        elif label == "changed-non-table-cell":
+            row = next(r for r in attempts if r["stage"] == "H")
+            row["judge_a_overall"] = "9" if row["judge_a_overall"] == "10" else "10"
         else:
             table = read_csv(target / "results.csv", RESULT_FIELDS)
             table[0]["n"] = "2"
@@ -249,7 +260,8 @@ def negative_controls(root, scratch):
         write_csv(target / "data/attempts.csv", fields, attempts)
         write_csv(target / "data/corrections.csv", CORRECTION_FIELDS, corrections)
         result = subprocess.run(
-            [sys.executable, "-B", str(Path(__file__).resolve()), "--root", str(target), "--check"],
+            [sys.executable, "-B", str(Path(__file__).resolve()), "--root", str(target),
+             "--acceptance" if label == "changed-non-table-cell" else "--check"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         require(result.returncode == 1, label + ": negative control did not go RED")
     return labels
@@ -263,6 +275,9 @@ def write_csv(path, fields, rows):
 
 
 def acceptance(root, attempts, corrections, table):
+    for name, pinned in FROZEN_DATA_SHA256.items():
+        observed = base64.b64encode(hashlib.sha256((root / name).read_bytes()).digest()).decode("ascii")
+        require(observed == pinned, Path(name).name + ": frozen SHA-256 mismatch")
     stages = Counter(r["stage"] for r in attempts)
     require(stages == {"0": 3, "1": 35, "H": 75, "2": 40}, "stage accounting mismatch")
     raw = Counter(raw_status(r) for r in attempts)
